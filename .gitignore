@@ -13,3 +13,8 @@ devnet-wallet.json
 images-cat.jpeg
 
 wallet.json
+# keys: never commit
+*wallet*.json
+*keypair*.json
+id.json
+dist/
