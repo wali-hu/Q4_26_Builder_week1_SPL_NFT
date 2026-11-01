@@ -12,29 +12,40 @@ import {
   setTransactionMessageLifetimeUsingBlockhash,
   signTransactionMessageWithSigners,
 } from "@solana/kit";
-import wallet from "../../devnet-wallet.json";
 import {
   findAssociatedTokenPda,
-  getCreateAssociatedTokenInstructionAsync,
+  getCreateAssociatedTokenIdempotentInstructionAsync,
   getTransferCheckedInstruction,
   TOKEN_PROGRAM_ADDRESS,
 } from "@solana-program/token";
+import {
+  explorer,
+  explorerAddr,
+  receiverWallet,
+  RPC_URL,
+  wallet,
+  WS_URL,
+} from "../wallet";
+import { need, saveState } from "../state";
 
-const rpc = createSolanaRpc("https://api.devnet.solana.com");
+const rpc = createSolanaRpc(RPC_URL);
+const rpcSubscriptions = createSolanaRpcSubscriptions(WS_URL);
 
-const rpcSubscriptions = createSolanaRpcSubscriptions(
-  "wss://api.devnet.solana.com",
-);
+const mint = address(need("mint"));
+const decimals = Number(need("decimals"));
 
-//paste your mint address got from spl_init.ts
-const mint = address("E2Jazz2VXcVL9RZkn6ZFA4q1YGvgEvrns3Gr6w72DC4w");
-
-//paste the address of the recipient
-const to = address("9EUd4VNcjMAysd7zQk3Q1a4tb28BYndLNBAQDiYnHJ64");
+// 100 whole tokens in base units.
+const amount = 100n * 10n ** BigInt(decimals);
 
 (async () => {
   try {
-    const signer = await createKeyPairSignerFromBytes(new Uint8Array(wallet));
+    const signer = await createKeyPairSignerFromBytes(wallet);
+    // Recipient wallet: by default my second devnet wallet, or pass TO=<address>.
+    const to = process.env.TO
+      ? address(process.env.TO)
+      : (await createKeyPairSignerFromBytes(receiverWallet())).address;
+    console.log(`recipient wallet: ${to}`);
+
     const sendAndConfirm = sendAndConfirmTransactionFactory({
       rpc,
       rpcSubscriptions,
@@ -54,35 +65,55 @@ const to = address("9EUd4VNcjMAysd7zQk3Q1a4tb28BYndLNBAQDiYnHJ64");
     });
     console.log(`Your toAta is : ${toAta}`);
 
-    // const createAtaIx =
+    // Tokens move between token accounts, not between wallets.
+    // The recipient may not have an ATA for this mint yet, so we (the sender)
+    // pay its rent and create it in the same transaction.
+    const createAtaIx = await getCreateAssociatedTokenIdempotentInstructionAsync({
+      payer: signer,
+      owner: to,
+      mint,
+    });
 
-    // const transferTx =
+    // transferChecked also passes the mint and decimals; the program rejects
+    // the transfer if they do not match, which catches "wrong decimals" bugs.
+    const transferIx = getTransferCheckedInstruction({
+      source: fromAta,
+      mint,
+      destination: toAta,
+      authority: signer, // owner of fromAta must sign
+      amount,
+      decimals,
+    });
 
     const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
-
     const msg = createTransactionMessage({ version: 0 });
-
     const msgWithPayer = setTransactionMessageFeePayerSigner(signer, msg);
-
-    const msgWithLiftime = setTransactionMessageLifetimeUsingBlockhash(
+    const msgWithLifetime = setTransactionMessageLifetimeUsingBlockhash(
       latestBlockhash,
       msgWithPayer,
     );
+    const txMessage = appendTransactionMessageInstructions(
+      [createAtaIx, transferIx],
+      msgWithLifetime,
+    );
 
-    // const txMessage = appendTransactionMessageInstructions(
-    //   [createAtaIx, transferTx],
-    //   msgWithLiftime,
-    // );
+    const signedTx = await signTransactionMessageWithSigners(txMessage);
+    assertIsTransactionWithBlockhashLifetime(signedTx);
+    const signature = getSignatureFromTransaction(signedTx);
+    await sendAndConfirm(signedTx, { commitment: "confirmed" });
 
-    // const signedTx = await signTransactionMessageWithSigners(txMessage);
+    const { value: fromBal } = await rpc.getTokenAccountBalance(fromAta).send();
+    const { value: toBal } = await rpc.getTokenAccountBalance(toAta).send();
+    console.log(`balances after: me ${fromBal.uiAmountString}, recipient ${toBal.uiAmountString}`);
+    console.log(`transfer txid: ${signature}`);
+    console.log(explorer(signature));
+    console.log(explorerAddr(toAta));
 
-    // assertIsTransactionWithBlockhashLifetime(signedTx);
-
-    // const signature = getSignatureFromTransaction(signedTx);
-
-    // await sendAndConfirm(signedTx, { commitment: "confirmed" });
-
-    // console.log(`mint txid: ${signature}`);
+    saveState({
+      receiver: to,
+      receiver_ata: toAta,
+      spl_transfer_tx: signature,
+    });
   } catch (error) {
     console.log(error);
   }
